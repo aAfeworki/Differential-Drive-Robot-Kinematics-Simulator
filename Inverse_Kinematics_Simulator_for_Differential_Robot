@@ -1,0 +1,277 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, CheckButtons
+from matplotlib.patches import Polygon
+
+# ---------------------------
+# Differential Drive IK Simulator (Click-to-Move)
+# ---------------------------
+
+# ----- Parameters -----
+r = 0.05     # wheel radius [m]
+L = 0.40     # wheel track [m]
+Ts = 0.05    # integration timestep [s]
+
+# Go-to-goal controller gains and saturations
+K_rho   = 4.2     # linear gain
+K_alpha = 4.0     # angular gain
+V_max   = 1.0     # m/s
+W_max   = 6.0     # rad/s
+goal_tol = 0.03   # m, threshold to "reach" a waypoint
+
+# Visual geometry
+body_len = 0.60
+body_wid = 0.36
+wheel_len = 0.14
+wheel_wid = 0.05
+
+# Initial state
+X = 0.0
+Y = 0.0
+alpha = 0.0
+
+# State variables used in info box & ICR
+V = 0.0
+w = 0.0
+
+def rot2d(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def rect_polygon(cx, cy, length, width, heading):
+    half_l, half_w = length / 2.0, width / 2.0
+    corners_local = np.array([
+        [ half_l,  half_w],
+        [ half_l, -half_w],
+        [-half_l, -half_w],
+        [-half_l,  half_w],
+    ])
+    Rm = rot2d(heading)
+    pts = (Rm @ corners_local.T).T + np.array([cx, cy])
+    return pts
+
+def icr_from_Vw(V_val, w_val, Xc, Yc, alpha_c):
+    if abs(w_val) < 1e-9:
+        return np.inf, np.nan, np.nan
+    R = V_val / w_val
+    x_icr = Xc - R * np.sin(alpha_c)
+    y_icr = Yc + R * np.cos(alpha_c)
+    return R, x_icr, y_icr
+
+def wrap_to_pi(a):
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+# ----- Matplotlib figure & artists -----
+plt.close("all")
+fig = plt.figure(figsize=(10, 7))
+# Make room on the right for buttons/checks (no sliders now)
+ax = fig.add_axes([0.06, 0.08, 0.66, 0.88])
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-2, 2)
+ax.set_ylim(-2, 2)
+ax.grid(True, alpha=0.3)
+ax.set_title("Differential Drive Inverse Kinematics (Click to Move)")
+
+# Path trace
+path_x, path_y = [X], [Y]
+path_line, = ax.plot(path_x, path_y, lw=1.5, alpha=0.8)
+
+# Clicked targets (dots)
+target_pts = []                # list of (x, y) tuples (queue)
+targets_scat = ax.scatter([], [], s=30, marker="o")
+
+# Robot body polygon
+body_poly = Polygon(rect_polygon(X, Y, body_len, body_wid, alpha), closed=True,
+                    facecolor=(0.2, 0.5, 1.0, 0.25), edgecolor="k", lw=1.5)
+ax.add_patch(body_poly)
+
+# Four wheels (visual)
+wheel_offsets_body = [
+    ( body_len*0.30,  body_wid/2 + wheel_wid/2),  # front-right (body frame)
+    ( body_len*0.30, -body_wid/2 - wheel_wid/2),  # front-left
+    (-body_len*0.30,  body_wid/2 + wheel_wid/2),  # rear-right
+    (-body_len*0.30, -body_wid/2 - wheel_wid/2),  # rear-left
+]
+wheel_polys = []
+for _ in wheel_offsets_body:
+    poly = Polygon(rect_polygon(X, Y, wheel_len, wheel_wid, alpha), closed=True,
+                   facecolor=(0.12, 0.12, 0.12, 0.9), edgecolor="k", lw=1.0)
+    ax.add_patch(poly)
+    wheel_polys.append(poly)
+
+# Heading arrow
+head_len = body_len * 0.55
+arrow_line, = ax.plot([], [], lw=2.0)
+
+# ICR marker
+icr_marker = ax.scatter([], [], s=30, marker="x")
+
+# Info box (top-right on axes)
+infotxt = ax.text(0.99, 0.98, "", transform=ax.transAxes, ha="right", va="top",
+                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.90, lw=0.8),
+                  family="monospace", fontsize=9)
+
+def update_targets_artist():
+    if len(target_pts) == 0:
+        targets_scat.set_offsets(np.empty((0, 2)))
+    else:
+        targets_scat.set_offsets(np.array(target_pts))
+
+def update_robot_artist():
+    """Update polygons, arrow, path, ICR marker and info text."""
+    # body
+    body_poly.set_xy(rect_polygon(X, Y, body_len, body_wid, alpha))
+    # wheels
+    Rm = rot2d(alpha)
+    for poly, (ox, oy) in zip(wheel_polys, wheel_offsets_body):
+        wx, wy = (Rm @ np.array([ox, oy])) + np.array([X, Y])
+        poly.set_xy(rect_polygon(wx, wy, wheel_len, wheel_wid, alpha))
+    # heading arrow
+    nose = np.array([X, Y]) + head_len * np.array([np.cos(alpha), np.sin(alpha)])
+    arrow_line.set_data([X, nose[0]], [Y, nose[1]])
+    # ICR
+    Rcur, x_icr, y_icr = icr_from_Vw(V, w, X, Y, alpha)
+    if np.isfinite(Rcur):
+        icr_marker.set_offsets([[x_icr, y_icr]])
+    else:
+        icr_marker.set_offsets(np.empty((0, 2)))
+    # path
+    path_line.set_data(path_x, path_y)
+    # info box
+    R_str = f"{Rcur: .3f} m" if np.isfinite(Rcur) else "  ∞"
+    info = (
+        f"ICR R: {R_str}\n"
+        f"w: {w: .4f} rad/s\n"
+        f"alpha: {alpha: .4f} rad\n"
+        f"X: {X: .3f} m\n"
+        f"Y: {Y: .3f} m"
+    )
+    infotxt.set_text(info)
+
+# ----- UI controls (buttons, checks) -----
+ax_btn_run = fig.add_axes([0.78, 0.36, 0.085, 0.05])
+ax_btn_rst = fig.add_axes([0.875, 0.36, 0.085, 0.05])
+btn_run = Button(ax_btn_run, "Run/Pause")
+btn_rst = Button(ax_btn_rst, "Reset")
+
+ax_chk = fig.add_axes([0.78, 0.26, 0.18, 0.09])
+chk = CheckButtons(ax_chk, ["Show ICR", "Leave Path"], [True, True])
+chk_labels = [lbl.get_text() for lbl in chk.labels]
+
+_running = {"flag": True}
+_leave_path = {"flag": True}   # mirror checkbox state
+
+# ----- Mouse click to add targets -----
+def on_click(event):
+    # only accept clicks on main axes with valid data coords
+    if event.inaxes != ax or event.xdata is None or event.ydata is None:
+        return
+    target_pts.append((event.xdata, event.ydata))
+    if _leave_path["flag"]:
+        update_targets_artist()
+    fig.canvas.draw_idle()
+
+cid_click = fig.canvas.mpl_connect('button_press_event', on_click)
+
+# ----- Button & checkbox callbacks -----
+def toggle_run(event):
+    _running["flag"] = not _running["flag"]
+
+def do_reset(event):
+    global X, Y, alpha, V, w, path_x, path_y, target_pts
+    X, Y, alpha = 0.0, 0.0, 0.0
+    V, w = 0.0, 0.0
+    path_x, path_y = [X], [Y]
+    target_pts = []
+    update_targets_artist()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+btn_run.on_clicked(toggle_run)
+btn_rst.on_clicked(do_reset)
+
+def on_check(label):
+    states = dict(zip(chk_labels, chk.get_status()))
+    show_icr = states.get("Show ICR", True)
+    leave_path = states.get("Leave Path", True)
+    _leave_path["flag"] = leave_path
+    icr_marker.set_visible(show_icr)
+
+    if not leave_path:
+        # Clear path and remove clicked dots (visual)
+        path_x.clear(); path_y.clear()
+        path_x.append(X); path_y.append(Y)
+        targets_scat.set_offsets(np.empty((0, 2)))
+    else:
+        # Re-show dots if any exist
+        update_targets_artist()
+
+    fig.canvas.draw_idle()
+
+chk.on_clicked(on_check)
+
+# ----- Controller (go-to-goal) -----
+def control_to_goal():
+    """Compute (V, w) to drive toward the current target; (0,0) if none."""
+    if len(target_pts) == 0:
+        return 0.0, 0.0
+
+    xg, yg = target_pts[0]
+    dx = xg - X
+    dy = yg - Y
+    rho = np.hypot(dx, dy)
+    if rho < goal_tol:
+        # Reached this goal; pop and move to next
+        target_pts.pop(0)
+        # Update dots if visible
+        if _leave_path["flag"]:
+            update_targets_artist()
+        return 0.0, 0.0
+
+    # Bearing to goal and heading error
+    theta_goal = np.arctan2(dy, dx)
+    alpha_err  = wrap_to_pi(theta_goal - alpha)
+
+    # Proportional control with saturation
+    v_cmd = np.clip(K_rho * rho, -V_max, V_max)
+    w_cmd = np.clip(K_alpha * alpha_err, -W_max, W_max)
+    return v_cmd, w_cmd
+
+# ----- Simulation step -----
+def step():
+    global X, Y, alpha, V, w
+    if not _running["flag"]:
+        return
+
+    # IK controller to current goal
+    V, w = control_to_goal()
+
+    # Integrate model
+    X += V * Ts * np.cos(alpha)
+    Y += V * Ts * np.sin(alpha)
+    alpha = wrap_to_pi(alpha + w * Ts)
+
+    # Path trace
+    if _leave_path["flag"]:
+        path_x.append(X)
+        path_y.append(Y)
+    else:
+        # keep only current position
+        if len(path_x) > 0:
+            path_x[-1] = X
+            path_y[-1] = Y
+        else:
+            path_x[:] = [X]; path_y[:] = [Y]
+
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+# Create and start backend-agnostic timer
+timer = fig.canvas.new_timer(interval=int(Ts * 1000))
+timer.add_callback(step)
+timer.start()
+
+# Initial draw
+update_targets_artist()
+update_robot_artist()
+plt.show()
